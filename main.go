@@ -7,17 +7,17 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
-	"path"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	cp "github.com/otiai10/copy"
+	"github.com/tmswfrk/photoImport/dateParser"
+	"github.com/tmswfrk/photoImport/logger"
 )
 
 const (
@@ -38,21 +38,23 @@ func main() {
 
 	// set up flags for CLI
 	var (
-		logPath string
-		srcDir  string
-		dstDir  string
-		dryRun  bool
-		workers int
+		logPath   string
+		srcDir    string
+		dstDir    string
+		syncTimes bool
+		dryRun    bool
+		workers   int
 	)
 	flag.StringVar(&logPath, "log-path", defaultLogLocation, "Path to log file")
 	flag.StringVar(&srcDir, "src-dir", defaultSrcDir, "Path to source directory")
 	flag.StringVar(&dstDir, "dst-dir", defaultDstDir, "Path to destination directory")
+	flag.BoolVar(&syncTimes, "sync-times", false, "Also sync file modification time to creation time")
 	flag.BoolVar(&dryRun, "dry-run", false, "Perform a dry run")
 	flag.IntVar(&workers, "workers", 10, "Number of concurrent workers")
 	flag.Parse()
 
 	// Set up logger
-	cleanup, loggerSetupErr := setupLogger(logPath, dryRun)
+	cleanup, loggerSetupErr := logger.Setup(logPath, dryRun)
 	defer cleanup()
 	if loggerSetupErr != nil {
 		panic(loggerSetupErr)
@@ -79,7 +81,7 @@ func main() {
 	}
 
 	// Locate photos in the source directory
-	photosFound, locateErr := locatePhotos(srcDir, dstDir)
+	photosFound, locateErr := locatePhotos(srcDir)
 	if locateErr != nil {
 		panic(locateErr)
 	}
@@ -91,8 +93,8 @@ func main() {
 
 	// perform concurrent copy
 	start := time.Now()
-	copiedCount, copyErr := copyPhotos(photosFound, workers, dryRun)
-	if copyErr != nil {
+	copiedCount, copyErr := copyPhotos(photosFound, dstDir, workers, syncTimes, dryRun)
+	if copyErr != nil && !dryRun {
 		slog.Error("Error copying photos", "error", copyErr, "success_count", copiedCount)
 		os.Exit(1)
 	}
@@ -100,36 +102,10 @@ func main() {
 		"elapsed_time", time.Since(start), "average_per_item", time.Since(start)/time.Duration(copiedCount))
 }
 
-// configure a logger for writing to a given file, providing a proper cleanup function
-func setupLogger(logPath string, dryRun bool) (func(), error) {
-	// dynamically build up log file name if non-dry-run so that each run is a different filename, based on a timestamp
-	if !dryRun {
-		logPath = path.Join(path.Dir(logPath), fmt.Sprintf("%s_%s.log",
-			strings.TrimSuffix(path.Base(logPath), ".log"), getTimestamp()))
-	}
-	// write to stderr to tell user where log is being written
-	_, _ = fmt.Fprintln(os.Stderr, "Writing log to", logPath)
-
-	file, err := os.OpenFile(logPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
-	if err != nil {
-		return nil, err
-	}
-	cleanup := func() {
-		if closeErr := file.Close(); closeErr != nil {
-			_, _ = fmt.Fprintf(os.Stderr, "Error closing log file: %v\n", closeErr)
-		}
-	}
-	slog.SetDefault(slog.New(slog.NewTextHandler(file, nil)))
-	return cleanup, nil
-}
-
-func getTimestamp() string {
-	return time.Now().Format("20060102_150405")
-}
-
 // locatePhotos returns a map of file paths to file info for all files in a given directory
-func locatePhotos(srcDir, dstDir string) ([]photoInfo, error) {
-	var fileData []photoInfo
+func locatePhotos(srcDir string) (chan string, error) {
+	//var fileData []photoInfo
+	var fileData []string
 	err := filepath.WalkDir(srcDir, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -139,112 +115,82 @@ func locatePhotos(srcDir, dstDir string) ([]photoInfo, error) {
 			strings.HasSuffix(filepath.Ext(d.Name()), ".AAE") {
 			return nil
 		}
-		// get modified time
-		info, infoErr := d.Info()
-		if infoErr != nil {
-			return infoErr
-		}
-
-		// extract system-specific data pointer to birth time of file
-		var birthTime time.Time // default to zero value in case the below assertion doesn't work
-		statStruct, ok := info.Sys().(*syscall.Stat_t)
-		if ok {
-			birthTime = time.Unix(statStruct.Birthtimespec.Sec, statStruct.Birthtimespec.Nsec)
-		}
-
-		// determine final destination of file
-		var (
-			year, month, _ = info.ModTime().Date()
-			dstDateDirName = filepath.Join(dstDir, strconv.Itoa(year), fmt.Sprintf("%d-%02d", year, month))
-			copiedFilePath = filepath.Join(dstDateDirName, filepath.Base(path))
-		)
 
 		// add info to our slice
-		fileData = append(fileData, photoInfo{
-			origPath:      path,
-			origModTime:   info.ModTime(),
-			origBirthTime: birthTime,
-			destPath:      copiedFilePath,
-		})
-
+		fileData = append(fileData, path)
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	return fileData, nil
-}
 
-// photoInfo is a struct that makes the channel add / receive operations easier to follow.
-type photoInfo struct {
-	origPath      string
-	origModTime   time.Time
-	origBirthTime time.Time
-	destPath      string
+	// return as a read-from channel
+	var ch = make(chan string, len(fileData))
+	for _, fPath := range fileData {
+		ch <- fPath
+		slog.Info("Queued photo", "src_path", fPath)
+	}
+	close(ch)
+	return ch, nil
 }
 
 // copyPhotos concurrently copies all photos in a given directory to a new directory,
 // creating each destination directory if it doesn't exist. The destination directory
 // is structured as YYYY/YYYY-MM/.
-func copyPhotos(photos []photoInfo, workerCount int, dryRun bool) (int32, error) {
+func copyPhotos(photos <-chan string, dstDir string, workerCount int, syncTimes, dryRun bool) (int32, error) {
 	var (
-		ch                = make(chan photoInfo, len(photos))
 		errs              []error
 		mu                = new(sync.RWMutex)
-		queuedCount       = new(atomic.Int32)
 		copiedCount       = new(atomic.Int32)
 		dryRunDirsCreated = make(map[string]struct{})
 	)
 
-	// add to queue each photo and start processing immediately since this is being run concurrently.
-	go func(photos []photoInfo, ch chan photoInfo) {
-		for _, photoDetails := range photos {
-			ch <- photoDetails
-			slog.Info("Queued photo", "src_path", photoDetails.origPath, "dst_path", photoDetails.destPath)
-			queuedCount.Add(1)
-		}
-		close(ch)
-		slog.Info("Queued photos", "count", queuedCount.Load())
-	}(photos, ch)
-
 	var wg = new(sync.WaitGroup)
 	for i := 0; i < workerCount; i++ {
 		wg.Go(func() {
-			for photo := range ch {
+			for photoPath := range photos {
 				// verify that the dir(s) are created before attempting to copy each file to its respective location
+				metaData, metaDataErr := getExifMetadata(photoPath, dstDir)
+				if metaDataErr != nil {
+					mu.Lock()
+					errs = append(errs, metaDataErr)
+					mu.Unlock()
+					continue
+				}
+
 				if !dryRun {
-					if mkDirErr := os.MkdirAll(filepath.Dir(photo.destPath), 0755); mkDirErr != nil {
+					if mkDirErr := os.MkdirAll(filepath.Dir(metaData.destPath), 0755); mkDirErr != nil {
 						mu.Lock()
 						errs = append(errs, mkDirErr)
 						mu.Unlock()
-						return
+						continue
 					}
 
 					// perform copy of this file to the destination location
 					copyStartTime := time.Now()
-					if copyErr := cp.Copy(photo.origPath, photo.destPath, cp.Options{PreserveTimes: true}); copyErr != nil {
+					if copyErr := cp.Copy(photoPath, metaData.destPath, cp.Options{PreserveTimes: true}); copyErr != nil {
 						mu.Lock()
 						errs = append(errs, copyErr)
 						mu.Unlock()
-						return
+						continue
 					}
-					slog.Info("Copied photo", "worker_id", i, "src_path", photo.origPath,
-						"dst_path", photo.destPath, "elapsed_time", time.Since(copyStartTime))
+					slog.Info("Copied photo", "worker_id", i, "src_path", photoPath,
+						"dst_path", metaData.destPath, "elapsed_time", time.Since(copyStartTime))
 
 					// Additionally, need to set the birthtime (b_time) on the output file by shelling out to the MacOS
 					// specific binary `SetFile`. This is to avoid using CGO to perform the same action (which is likely
 					// faster to do at scale, but is far more complex and is still CGO).
 					setFileStartTime := time.Now()
-					if setFileErr := setFileCreationTime(photo.destPath, photo.origBirthTime); setFileErr != nil {
+					if setFileErr := setFileCreationTime(metaData.destPath, metaData.origBirthTime, syncTimes); setFileErr != nil {
 						mu.Lock()
 						errs = append(errs, setFileErr)
 						mu.Unlock()
 						// okay to continue
 					}
-					slog.Info("Set birthtime", "worker_id", i, "path", photo.destPath,
-						"birth_time", photo.origBirthTime, "elapsed_time", time.Since(setFileStartTime))
+					slog.Info("Set birthtime", "worker_id", i, "path", metaData.destPath,
+						"birth_time", metaData.origBirthTime, "elapsed_time", time.Since(setFileStartTime))
 				} else {
-					dstDateDirName := filepath.Dir(photo.destPath)
+					dstDateDirName := filepath.Dir(metaData.destPath)
 					if _, statErr := os.Stat(dstDateDirName); errors.Is(statErr, os.ErrNotExist) {
 						mu.Lock()
 						if _, ok := dryRunDirsCreated[dstDateDirName]; !ok {
@@ -253,7 +199,7 @@ func copyPhotos(photos []photoInfo, workerCount int, dryRun bool) (int32, error)
 						}
 						mu.Unlock()
 					}
-					slog.Info("DRY RUN copy photo", "worker_id", i, "src_path", photo.origPath, "dst_path", photo.destPath)
+					slog.Info("DRY RUN copy photo", "worker_id", i, "src_path", photoPath, "dst_path", metaData.destPath)
 				}
 				// common to both dry run and non-dry run
 				copiedCount.Add(1)
@@ -269,11 +215,57 @@ func copyPhotos(photos []photoInfo, workerCount int, dryRun bool) (int32, error)
 	return copiedCount.Load(), nil
 }
 
+type photoMetaData struct {
+	destPath      string
+	exifDateTime  time.Time
+	origBirthTime time.Time
+}
+
+// getExifMetadata returns metadata for photoPath, including its birth date and dated destination under dstDir.
+// It returns an error if the file cannot be opened, statted, or dated.
+func getExifMetadata(photoPath, dstDir string) (*photoMetaData, error) {
+	// open the file
+	f, openErr := os.Open(photoPath)
+	if openErr != nil {
+		return nil, openErr
+	}
+	defer f.Close()
+
+	// also attempt to get the file info from stat'ing the file
+	fi, statErr := f.Stat()
+	if statErr != nil {
+		return nil, statErr
+	}
+
+	// Using the above file handle and fileInfo, determine a "birthdate" of this file, preferring
+	// exif data if located rather than using a syscall to determine it.
+	origBirthTime, bdErr := dateParser.DetermineBirthDate(f, fi)
+	if bdErr != nil {
+		return nil, bdErr
+	}
+
+	// determine final destination of file based on the timestamp found
+	var (
+		year, month, _ = origBirthTime.Date()
+		dstDateDirName = filepath.Join(dstDir, strconv.Itoa(year), fmt.Sprintf("%d-%02d", year, month))
+		copiedFilePath = filepath.Join(dstDateDirName, filepath.Base(photoPath))
+	)
+
+	return &photoMetaData{
+		destPath:      copiedFilePath,
+		origBirthTime: origBirthTime,
+	}, nil
+}
+
 // setFileCreationTime sets the birthtime (b_time) on a given file.
-func setFileCreationTime(filePath string, birthTime time.Time) error {
+func setFileCreationTime(filePath string, birthTime time.Time, syncTimes bool) error {
 	var (
 		dateFmt = birthTime.Format("01/02/2006 15:04:05")
-		cmd     = exec.Command("SetFile", "-d", dateFmt, filePath)
+		args    = []string{"-d", dateFmt}
 	)
+	if syncTimes {
+		args = append(args, "-m", dateFmt)
+	}
+	cmd := exec.Command("SetFile", append(args, filePath)...)
 	return cmd.Run()
 }
